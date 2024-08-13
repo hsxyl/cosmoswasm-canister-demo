@@ -1,0 +1,474 @@
+use bip32::{Seed, XPrv};
+use candid::{CandidType, Decode, Deserialize, Encode, Principal};
+use getrandom::{register_custom_getrandom, Error};
+use ic_stable_structures::{storable::Bound, StableBTreeMap, StableCell, Storable};
+use serde::Serialize;
+use serde_bytes::ByteBuf;
+use std::{borrow::Cow, cell::RefCell, time::Duration};
+
+mod memory;
+
+use memory::Memory;
+
+const MAX_VALUE_SIZE: u32 = 100;
+
+#[derive(CandidType, Deserialize, Serialize, Debug)]
+pub struct SchnorrPublicKeyArgs {
+    pub canister_id: Option<Principal>,
+    pub derivation_path: Vec<ByteBuf>,
+    pub key_id: SchnorrKeyId,
+}
+
+#[derive(CandidType, Deserialize, Debug)]
+pub struct SchnorrPublicKeyResult {
+    pub public_key: ByteBuf,
+    pub chain_code: ByteBuf,
+}
+
+#[derive(CandidType, Deserialize, Serialize, Debug)]
+pub struct SignWithSchnorrArgs {
+    pub message: ByteBuf,
+    pub derivation_path: Vec<ByteBuf>,
+    pub key_id: SchnorrKeyId,
+}
+
+#[derive(CandidType, Deserialize, Debug)]
+pub struct SignWithSchnorrResult {
+    pub signature: ByteBuf,
+}
+
+#[derive(CandidType, Deserialize, Serialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SchnorrAlgorithm {
+    #[serde(rename = "bip340secp256k1")]
+    Bip340Secp256k1,
+    #[serde(rename = "ed25519")]
+    Ed25519,
+}
+
+#[derive(CandidType, Deserialize, Serialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SchnorrKeyId {
+    algorithm: SchnorrAlgorithm,
+    name: String,
+}
+
+pub enum SchnorrKeyIds {
+    DfxTestKey,
+    TestKey1,
+    DfxTestKeyEd25519,
+    TestKey1Ed25519,
+}
+
+impl SchnorrKeyIds {
+    pub fn schnorr_public_keyto_key_id(&self) -> SchnorrKeyId {
+        match self {
+            Self::DfxTestKey => SchnorrKeyId {
+                algorithm: SchnorrAlgorithm::Bip340Secp256k1,
+                name: "dfx_test_key".to_string(),
+            },
+            Self::TestKey1 => SchnorrKeyId {
+                algorithm: SchnorrAlgorithm::Bip340Secp256k1,
+                name: "test_key_1".to_string(),
+            },
+            Self::DfxTestKeyEd25519 => SchnorrKeyId {
+                algorithm: SchnorrAlgorithm::Ed25519,
+                name: "dfx_test_key".to_string(),
+            },
+            Self::TestKey1Ed25519 => SchnorrKeyId {
+                algorithm: SchnorrAlgorithm::Ed25519,
+                name: "test_key_1".to_string(),
+            },
+        }
+    }
+
+    fn variants() -> Vec<SchnorrKeyIds> {
+        vec![
+            SchnorrKeyIds::DfxTestKey,
+            SchnorrKeyIds::TestKey1,
+            SchnorrKeyIds::DfxTestKeyEd25519,
+            SchnorrKeyIds::TestKey1Ed25519,
+        ]
+    }
+}
+
+impl Storable for SchnorrKeyId {
+    fn to_bytes(&self) -> std::borrow::Cow<[u8]> {
+        Cow::Owned(Encode!(self).unwrap())
+    }
+
+    fn from_bytes(bytes: std::borrow::Cow<[u8]>) -> Self {
+        Decode!(bytes.as_ref(), Self).unwrap()
+    }
+
+    const BOUND: Bound = Bound::Bounded {
+        max_size: MAX_VALUE_SIZE,
+        is_fixed_size: false,
+    };
+}
+
+#[derive(Clone, Debug, CandidType, Deserialize)]
+struct HttpRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: ByteBuf,
+    pub certificate_version: Option<u16>,
+}
+
+type HeaderField = (String, String);
+
+#[derive(Clone, Debug, CandidType, Deserialize)]
+struct HttpResponse {
+    pub status_code: u16,
+    pub headers: Vec<HeaderField>,
+    pub body: ByteBuf,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Metrics {
+    pub balance: u128,
+    pub sig_count: u128,
+}
+
+#[derive(Serialize, Deserialize)]
+struct State {
+    // The seeds for the keys are stored in a stable memory.
+    #[serde(skip, default = "init_stable_data")]
+    seeds: StableBTreeMap<SchnorrKeyId, [u8; 64], Memory>,
+
+    #[serde(skip, default = "init_sig_count")]
+    sig_count: StableCell<u128, Memory>,
+}
+
+thread_local! {
+    static STATE: RefCell<State> = RefCell::new(State::default());
+}
+
+#[ic_cdk::init]
+fn init() {
+    ic_cdk_timers::set_timer(Duration::ZERO, || {
+        for key in SchnorrKeyIds::variants() {
+            ic_cdk::spawn(async move {
+                let seed = get_random_seed().await;
+                STATE.with(|s| {
+                    let seeds = &mut s.borrow_mut().seeds;
+                    seeds
+                        .get(&key.to_key_id())
+                        .or_else(|| seeds.insert(key.to_key_id(), seed));
+                });
+            });
+        }
+    });
+}
+#[ic_cdk::update]
+fn schnorr_public_key(arg: SchnorrPublicKeyArgs) -> SchnorrPublicKeyResult {
+    let seed = Seed::new(STATE.with(|s| {
+        s.borrow()
+            .seeds
+            .get(&arg.key_id)
+            .unwrap_or_else(|| panic!("No key with name {:?}", &arg.key_id))
+    }));
+
+    let canister_id = match arg.canister_id {
+        Some(canister_id) => canister_id,
+        None => ic_cdk::caller(),
+    };
+
+    match arg.key_id.algorithm {
+        SchnorrAlgorithm::Bip340Secp256k1 => {
+            let derivation_path = derivation_path_ext_bip32(&canister_id, &arg.derivation_path);
+            schnorr_public_key_secp256k1(seed, derivation_path)
+        },
+        SchnorrAlgorithm::Ed25519 => {
+            let derivation_path = derivation_path_ed25519(&canister_id, &arg.derivation_path);
+            schnorr_public_key_ed25519(seed, derivation_path)
+        },
+    }
+}
+
+#[ic_cdk::update]
+fn sign_with_schnorr(arg: SignWithSchnorrArgs) -> SignWithSchnorrResult {
+    let seed = Seed::new(STATE.with(|s| {
+        s.borrow()
+            .seeds
+            .get(&arg.key_id)
+            .unwrap_or_else(|| panic!("No key with name {:?}", &arg.key_id))
+    }));
+
+    // Increment the signature count
+    STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let current_count = *state.sig_count.get();
+        let _ = state.sig_count.set(current_count + 1);
+    });
+
+    let canister_id = ic_cdk::caller();
+
+    match arg.key_id.algorithm {
+        SchnorrAlgorithm::Bip340Secp256k1 => {
+            let derivation_path = derivation_path_ext_bip32(&canister_id, &arg.derivation_path);
+            sign_with_schnorr_secp256k1(seed, derivation_path, arg.message)
+        }
+        SchnorrAlgorithm::Ed25519 => {
+            let derivation_path = derivation_path_ed25519(&canister_id, &arg.derivation_path);
+            sign_with_schnorr_ed25519(seed, derivation_path, arg.message)
+        },
+    }
+}
+
+#[ic_cdk::update]
+fn get_private_key(principal: Principal) -> String {
+    let _derivation_path: Vec<ByteBuf> = [vec![1u8; 4]] // Example derivation path for signing
+    .iter()
+    .map(|v| ByteBuf::from(v.clone()))
+    .collect();
+
+    let seed = Seed::new(STATE.with(|s| {
+        s.borrow()
+            .seeds
+            .get(&SchnorrKeyIds::TestKey1.to_key_id())
+            .unwrap()
+    }));
+
+    let derivation_path = derivation_path_ext_bip32(&principal, &_derivation_path);
+
+    let root_xprv = XPrv::new(&seed).unwrap();
+    let private_key_bytes = root_xprv.private_key().to_bytes();
+
+    let master_chain_code = [0u8; 32];
+    let res = derivation_path
+        .private_key_derivation(&private_key_bytes, &master_chain_code)
+        .expect("Should derive key");
+
+    serde_json::to_string(&res.derived_private_key).unwrap()
+    // res.derived_private_key
+}
+
+fn derivation_path_ext_bip32(
+    canister_id: &Principal,
+    derivation_path: &Vec<ByteBuf>,
+) -> ic_crypto_extended_bip32::DerivationPath {
+    let mut path = vec![];
+    let derivation_index = ic_crypto_extended_bip32::DerivationIndex(canister_id.as_slice().to_vec());
+    path.push(derivation_index);
+
+    for index in derivation_path {
+        path.push( ic_crypto_extended_bip32::DerivationIndex(index.to_vec()));
+    }
+    ic_crypto_extended_bip32::DerivationPath::new(path)
+}
+
+fn derivation_path_ed25519(
+    canister_id: &Principal,
+    derivation_path: &Vec<ByteBuf>,
+) -> ic_crypto_ed25519::DerivationPath {
+    let mut path = vec![];
+    let derivation_index = ic_crypto_ed25519::DerivationIndex(canister_id.as_slice().to_vec());
+    path.push(derivation_index);
+
+    for index in derivation_path {
+        path.push(ic_crypto_ed25519::DerivationIndex(index.to_vec()));
+    }
+    ic_crypto_ed25519::DerivationPath::new(path)
+}
+
+fn schnorr_public_key_secp256k1(
+    seed: Seed,
+    derivation_path: ic_crypto_extended_bip32::DerivationPath,
+) -> SchnorrPublicKeyResult {
+    let root_xprv = XPrv::new(&seed).unwrap();
+    let public_key_bytes = root_xprv.public_key().to_bytes();
+
+    let master_chain_code = [0u8; 32];
+    let res = derivation_path
+        .public_key_derivation(&public_key_bytes, &master_chain_code)
+        .expect("Should derive key");
+
+    SchnorrPublicKeyResult {
+        public_key: ByteBuf::from(res.derived_public_key),
+        chain_code: ByteBuf::from(res.derived_chain_code),
+    }
+}
+
+fn schnorr_public_key_ed25519(seed: Seed, derivation_path: ic_crypto_ed25519::DerivationPath) -> SchnorrPublicKeyResult {
+    let seed_32_bytes = <[u8; 32]>::try_from(&seed.as_bytes()[0..32]).expect("seed should be >= 32 bytes");
+    let master_secret = ic_crypto_ed25519::PrivateKey::deserialize_raw_32(&seed_32_bytes);
+    let (derived_secret, chain_code) = master_secret.derive_subkey(&derivation_path);
+    let public_key = derived_secret.public_key();
+
+    SchnorrPublicKeyResult {
+        public_key: ByteBuf::from(public_key.serialize_raw().to_vec()),
+        chain_code: ByteBuf::from(chain_code.to_vec()),
+    }
+}
+
+fn sign_with_schnorr_secp256k1(
+    seed: Seed,
+    derivation_path: ic_crypto_extended_bip32::DerivationPath,
+    message: ByteBuf,
+) -> SignWithSchnorrResult {
+    use k256::schnorr::SigningKey;
+
+    let root_xprv = XPrv::new(&seed).unwrap();
+    let private_key_bytes = root_xprv.private_key().to_bytes();
+
+    let master_chain_code = [0u8; 32];
+    let res = derivation_path
+        .private_key_derivation(&private_key_bytes, &master_chain_code)
+        .expect("Should derive key");
+
+    let sk = SigningKey::from_bytes(&res.derived_private_key).expect("Should parse secret key");
+    let sig = sk
+        .sign_raw(&message, &Default::default())
+        .expect("should sign message");
+
+    SignWithSchnorrResult {
+        signature: ByteBuf::from(sig.to_bytes().to_vec()),
+    }
+}
+
+fn sign_with_schnorr_ed25519(
+    seed: Seed,
+    derivation_path: ic_crypto_ed25519::DerivationPath,
+    message: ByteBuf,
+) -> SignWithSchnorrResult {
+    let seed_32_bytes = <[u8; 32]>::try_from(&seed.as_bytes()[0..32]).expect("seed should be >= 32 bytes");
+    let master_secret = ic_crypto_ed25519::PrivateKey::deserialize_raw_32(&seed_32_bytes);
+    let (derived_secret, _chain_code) = master_secret.derive_subkey(&derivation_path);
+
+    SignWithSchnorrResult {
+        signature: ByteBuf::from(derived_secret.sign_message(&message).to_vec()),
+    }
+}
+
+#[ic_cdk::query]
+fn http_request(_req: HttpRequest) -> HttpResponse {
+    let sig_count = STATE.with(|s| *s.borrow().sig_count.get());
+    let balance = ic_cdk::api::canister_balance128();
+    let metrics = Metrics { balance, sig_count };
+
+    HttpResponse {
+        status_code: 200,
+        headers: vec![("content-type".to_string(), "application/json".to_string())],
+        body: ByteBuf::from(serde_json::to_string(&metrics).unwrap().as_bytes().to_vec()),
+    }
+}
+
+fn init_sig_count() -> StableCell<u128, Memory> {
+    StableCell::init(crate::memory::get_sig_count(), 0u128)
+        .expect("Could not initialize sig count memory")
+}
+
+fn init_stable_data() -> StableBTreeMap<SchnorrKeyId, [u8; 64], Memory> {
+    StableBTreeMap::init(crate::memory::get_seeds())
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            sig_count: init_sig_count(),
+            seeds: init_stable_data(),
+        }
+    }
+}
+
+async fn get_random_seed() -> [u8; 64] {
+    match ic_cdk::api::management_canister::main::raw_rand().await {
+        Ok(rand) => {
+            let mut rand = rand.0;
+            rand.extend(rand.clone());
+            let rand: [u8; 64] = rand.try_into().expect("Expected a Vec of length 64");
+            rand
+        }
+        Err(err) => {
+            ic_cdk::trap(format!("Error getting random seed: {:?}", err).as_str());
+        }
+    }
+}
+
+pub fn my_custom_random(_buf: &mut [u8]) -> Result<(), Error> {
+    ic_cdk::trap("Not implemented");
+}
+
+register_custom_getrandom!(my_custom_random);
+
+ic_cdk::export_candid!();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sign_and_verify_schnorr_secp256k1() {
+        use k256::schnorr::{Signature, VerifyingKey};
+
+        // Setup for signing
+        let test_seed = [1u8; 64];
+        // Example derivation path for signing
+        let derivation_path = [vec![1u8; 4]]
+            .iter()
+            .map(|v| ByteBuf::from(v.clone()))
+            .collect();
+        let indexes = derivation_path_ext_bip32(&Principal::anonymous(), &derivation_path);
+
+        let message = b"Test message";
+
+        // Call the sign function
+        let sign_reply = sign_with_schnorr_secp256k1(
+            Seed::new(test_seed),
+            indexes.clone(),
+            ByteBuf::from(message.to_vec()),
+        );
+
+        let public_key_reply = schnorr_public_key_secp256k1(Seed::new(test_seed), indexes.clone());
+
+        let raw_sec1_public_key = public_key_reply.public_key;
+        let raw_bip340_public_key = &raw_sec1_public_key[1..];
+
+        let verifying_key = VerifyingKey::from_bytes(raw_bip340_public_key).unwrap();
+
+        let signature = Signature::try_from(sign_reply.signature.as_ref())
+            .expect("should parse signature bytes");
+
+        // Verify the signature
+        assert!(verifying_key.verify_raw(message, &signature).is_ok());
+    }
+
+    #[test]
+    fn test_sign_and_verify_schnorr_ed25519() {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        // Setup for signing
+        let test_seed = [1u8; 64];
+        // Example derivation path for signing
+        let derivation_path = [vec![1u8; 4]]
+            .iter()
+            .map(|v| ByteBuf::from(v.clone()))
+            .collect();
+        let derivation_path = derivation_path_ed25519(&Principal::anonymous(), &derivation_path);
+
+        let message = b"Test message";
+
+        // Call the sign function
+        let sign_reply = sign_with_schnorr_ed25519(
+            Seed::new(test_seed),
+            derivation_path.clone(),
+            ByteBuf::from(message.to_vec()),
+        );
+
+        // Setup for verification
+        let signature =
+            Signature::from_slice(&sign_reply.signature).expect("Invalid signature format");
+
+        let public_key_reply = schnorr_public_key_ed25519(Seed::new(test_seed), derivation_path);
+
+        let raw_public_key = public_key_reply.public_key.as_slice();
+        assert_eq!(raw_public_key.len(), 32);
+        let mut public_key = [0u8; 32];
+        public_key.copy_from_slice(raw_public_key);
+
+        let public_key = VerifyingKey::from_bytes(&public_key).unwrap();
+
+        // Verify the signature
+        assert!(public_key.verify(message, &signature).is_ok());
+    }
+}
